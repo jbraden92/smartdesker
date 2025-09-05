@@ -93,7 +93,7 @@ if "rate_rules" not in st.session_state:
 # --------------------------
 # Header
 # --------------------------
-st.title("SmartDesk – AI Desking Assistant")
+st.title("SmartDesk – Desking Assistant")
 st.caption("Upload a rate sheet, enter the customer basics, and get a lender pick + clean structure snapshot.")
 
 with st.expander("How it learns from rate sheets", expanded=False):
