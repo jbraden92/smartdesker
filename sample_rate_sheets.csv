@@ -1,0 +1,3 @@
+name,min_score,max_repos,requires_dl,accepts_gig,allow_frame,max_age,apr,term,program,book_source,notes
+GFS Select+,520,1,False,True,False,15,22.95,72,Select+,nada_lending,No DL ok
+CPS Super Alpha,540,2,True,True,True,15,18.2,72,Super Alpha,blackbook,Nickel callbacks
