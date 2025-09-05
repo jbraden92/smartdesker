@@ -5,7 +5,7 @@ from io import BytesIO
 # --------------------------
 # App Config
 # --------------------------
-st.set_page_config(page_title="SmartDesk – AI Desking Assistant", page_icon="📋", layout="wide")
+st.set_page_config(page_title="SmartDesk – Desking Assistant", page_icon="📋", layout="wide")
 st.markdown(
     """
     <style>
@@ -93,7 +93,7 @@ if "rate_rules" not in st.session_state:
 # --------------------------
 # Header
 # --------------------------
-st.title("SmartDesk – AI Desking Assistant")
+st.title("SmartDesk – Desking Assistant")
 st.caption("Upload a rate sheet, enter the customer basics, and get a lender pick + clean structure snapshot.")
 
 with st.expander("How it learns from rate sheets", expanded=False):
@@ -119,7 +119,11 @@ with left:
         with col1:
             credit = st.number_input("Credit Score", 300, 850, 620, 1)
             income = st.number_input("Monthly Income ($)", 0, 20000, 3000, 50)
-            job_months = st.number_input("Job Time (months)", 0, 360, 6, 1)
+
+            # Years + Months -> total job months
+            job_years = st.number_input("Job Time (years)", 0, 60, 0, 1)
+            job_months_extra = st.number_input("Job Time (months)", 0, 11, 6, 1)
+            job_months = job_years * 12 + job_months_extra
 
         with col2:
             repos = st.number_input("# of Repos (reported)", 0, 10, 0, 1)
@@ -129,7 +133,7 @@ with left:
         with col3:
             trade_eq = st.number_input("Trade Equity ($)", -20000, 20000, 0, 100)
             gig_flag = st.checkbox("Gig / DoorDash income?")
-            gig_income = st.number_input("Gig Income ($/month)", 0, 20000, 0, 50)
+            gig_income = st.number_input("Gig Income ($/month)", 0, 20000, 0, 50, disabled=not gig_flag)
 
         include_co = st.checkbox("Include Co-Applicant?")
         if include_co:
@@ -151,151 +155,4 @@ with right:
         try:
             ext = ".csv" if rs_file.name.lower().endswith(".csv") else ".xlsx"
             st.session_state["rate_rules"] = load_rate_sheet_from_bytes(rs_file.read(), ext)
-            st.success(f"Loaded {len(st.session_state['rate_rules'])} lender rows from **{rs_file.name}**.")
-        except Exception as e:
-            st.error(f"Could not read file: {e}")
-
-    with st.expander("See current rules (top 20)", expanded=False):
-        st.dataframe(st.session_state["rate_rules"].head(20), use_container_width=True)
-
-# --------------------------
-# Decision Logic
-# --------------------------
-def score_lender(row, features):
-    """
-    Return (eligible: bool, reason: str, score: float) for a lender row
-    based on the current deal 'features'.
-    The 'score' ranks eligible lenders (higher = better fit).
-    """
-    cred = features["credit"]
-    repos = features["repos"]
-    job = features["job_months"]
-    income = features["income"] + features["gig_income"]
-    down = features["down"]
-    has_dl = features["has_dl"]
-    gig = features["gig"]
-
-    # Hard gates
-    if not (row.MinScore <= cred <= row.MaxScore):   return (False, "Score outside lender window", 0)
-    if repos > row.MaxRepos:                         return (False, "Too many repos for lender", 0)
-    if job < row.MinJobMonths:                       return (False, "Insufficient job time", 0)
-    if income < row.MinIncome:                       return (False, "Insufficient income", 0)
-    if down < row.MinDown:                           return (False, "Needs more down", 0)
-    if (not row.AllowNoDL) and (has_dl == "No"):     return (False, "DL required", 0)
-    if (not row.AllowGig) and gig and features["gig_income"] > 0:
-                                                    return (False, "Gig income not allowed", 0)
-
-    # Soft ranking: prefer near-middle of score window, more down, more income
-    # Keep it simple for now.
-    window_mid = (row.MinScore + row.MaxScore)/2.0
-    score = 0
-    score += 100 - abs(cred - window_mid) * 0.5
-    score += min(1000, down) / 20
-    score += min(4000, income) / 40
-    score += (30 if gig and row.AllowGig else 0)
-    score += (10 if (has_dl == "Yes") else 0)
-    return (True, "Meets program guidelines", score)
-
-def recommend_lenders(rules_df: pd.DataFrame, features: dict, topn=3):
-    rows = []
-    for _, r in rules_df.iterrows():
-        ok, why, s = score_lender(r, features)
-        rows.append({
-            "Lender": r.Lender,
-            "Eligible": ok,
-            "Reason": why,
-            "Score": round(s,1),
-            "MinDown": r.MinDown,
-            "MinIncome": r.MinIncome,
-            "MinJobMonths": r.MinJobMonths,
-            "MaxRepos": r.MaxRepos
-        })
-    df = pd.DataFrame(rows).sort_values(["Eligible","Score"], ascending=[False, False]).reset_index(drop=True)
-    top = df[df["Eligible"]].head(topn)
-    pick = top.iloc[0] if len(top) > 0 else None
-    return pick, top, df
-
-# --------------------------
-# Output
-# --------------------------
-if submitted:
-    features = {
-        "credit": credit,
-        "income": income,
-        "job_months": job_months,
-        "repos": repos,
-        "down": down,
-        "trade_eq": trade_eq,
-        "gig": bool(gig_flag),
-        "gig_income": gig_income if gig_flag else 0,
-        "has_dl": has_dl,
-        "co_score": co_score,
-        "co_income": co_income,
-    }
-
-    rules = st.session_state["rate_rules"].copy()
-    pick, top, audit = recommend_lenders(rules, features, topn=3)
-
-    st.markdown("### Result")
-    cols = st.columns([1.1, 1])
-    with cols[0]:
-        if pick is not None:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="metric">✅ Recommended Lender</div>', unsafe_allow_html=True)
-            st.markdown(f"**{pick['Lender']}**  \n<span class='em'>{pick['Reason']}</span>", unsafe_allow_html=True)
-            st.markdown("<hr/>", unsafe_allow_html=True)
-            st.markdown(f"- Est. **Score Rank**: {pick['Score']}")
-            st.markdown(f"- **Min Down**: ${int(pick['MinDown'])}  •  **Min Income**: ${int(pick['MinIncome'])}/mo")
-            st.markdown(f"- **Max Repos** allowed: {int(pick['MaxRepos'])}  •  **Min Job**: {int(pick['MinJobMonths'])} mo")
-            st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="metric">❌ No Eligible Lender Found</div>', unsafe_allow_html=True)
-            st.markdown("Try increasing down, adding a co-app, or choosing a vehicle with cleaner history.", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with cols[1]:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="metric">Top Matches</div>', unsafe_allow_html=True)
-        if len(top) > 0:
-            st.dataframe(
-                top[["Lender","Score","Reason","MinDown","MinIncome","MinJobMonths","MaxRepos"]],
-                use_container_width=True, height=180
-            )
-        else:
-            st.caption("No eligible lenders with the current inputs.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("### Deal Snapshot")
-    snapshot = {
-        "Primary Applicant": {
-            "Credit Score": credit,
-            "Monthly Income": income,
-            "Job Months": job_months,
-            "Repos": repos,
-            "Driver's License": has_dl,
-        },
-        "Structure": {
-            "Down Payment": down,
-            "Trade Equity": trade_eq,
-            "Gig Income": gig_income if gig_flag else 0
-        },
-        "Co-Applicant": {
-            "Included": include_co,
-            "Co Score": co_score if include_co else None,
-            "Co Income": co_income if include_co else 0
-        },
-        "Decision": {
-            "Picked Lender": None if pick is None else pick["Lender"],
-            "Reason": None if pick is None else pick["Reason"],
-            "Score": None if pick is None else pick["Score"],
-        }
-    }
-    st.json(snapshot, expanded=False)
-
-    with st.expander("Audit (all lenders)", expanded=False):
-        st.dataframe(audit, use_container_width=True)
-
-else:
-    st.info("Fill out the form and click **Evaluate Deal**.")
-
+            st.success(f"Loaded {len
