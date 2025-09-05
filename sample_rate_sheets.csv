@@ -1,3 +1,13 @@
-name,min_score,max_repos,requires_dl,accepts_gig,allow_frame,max_age,apr,term,program,book_source,notes
-GFS Select+,520,1,False,True,False,15,22.95,72,Select+,nada_lending,No DL ok
-CPS Super Alpha,540,2,True,True,True,15,18.2,72,Super Alpha,blackbook,Nickel callbacks
+import numpy as np  # make sure this is imported at the top
+
+DEFAULT_SAMPLE_RATE_SHEET = pd.DataFrame([
+    # Gateway – no min / no max score
+    {"Lender":"Gateway Financial Solutions","MinScore":np.nan,"MaxScore":np.nan,"MaxRepos":1,"MinJobMonths":3,"MinIncome":1800,"MinDown":500,"AllowGig":"Yes","AllowNoDL":"No","AllowFrame":"No"},
+
+    {"Lender":"Global Lending Services","MinScore":580,"MaxScore":720,"MaxRepos":2,"MinJobMonths":6,"MinIncome":2200,"MinDown":1000,"AllowGig":"Yes","AllowNoDL":"No","AllowFrame":"No"},
+    {"Lender":"Flagship Credit","MinScore":600,"MaxScore":750,"MaxRepos":2,"MinJobMonths":6,"MinIncome":2400,"MinDown":1000,"AllowGig":"Yes","AllowNoDL":"No","AllowFrame":"Yes"},
+    {"Lender":"Regional Acceptance","MinScore":590,"MaxScore":720,"MaxRepos":1,"MinJobMonths":12,"MinIncome":2500,"MinDown":1000,"AllowGig":"No","AllowNoDL":"No","AllowFrame":"No"},
+    {"Lender":"Prestige","MinScore":600,"MaxScore":750,"MaxRepos":0,"MinJobMonths":12,"MinIncome":2600,"MinDown":1000,"AllowGig":"No","AllowNoDL":"No","AllowFrame":"No"},
+    {"Lender":"Exeter","MinScore":550,"MaxScore":700,"MaxRepos":2,"MinJobMonths":6,"MinIncome":2000,"MinDown":500,"AllowGig":"Yes","AllowNoDL":"No","AllowFrame":"No"},
+    {"Lender":"Kemba CU","MinScore":640,"MaxScore":800,"MaxRepos":0,"MinJobMonths":12,"MinIncome":3000,"MinDown":1000,"AllowGig":"No","AllowNoDL":"No","AllowFrame":"No"},
+])
