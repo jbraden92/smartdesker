@@ -1,22 +1,8 @@
 # streamlit_app.py
-# Requirements:
-#   streamlit
-#   pandas
-#   numpy
-#   openpyxl
-#   pdfplumber
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-import re
-
-# Optional PDF parsing
-try:
-    import pdfplumber
-except Exception:
-    pdfplumber = None
 
 # =========================
 # Page config / styles
@@ -64,6 +50,8 @@ def _safe_int(x, default=0):
 # NOTE: These are POC defaults (not official rate cards).
 # =======================================
 DEFAULT_RULES = pd.DataFrame([
+    # Lender, Program, Score window (Gateway has no min score), repos/income/down,
+    # term/miles/ltv and policy flags (Gig/DL/Frame). Values are POC only.
     {"Lender":"Gateway Financial Solutions","Program":"Near/Sub","MinScore":None,"MaxScore":700,"MaxRepos":2,"MinIncome":2000,"MinDown":500,"MaxTerm":72,"MaxMiles":160000,"MaxLTV":130,"AllowGig":True,"AllowNoDL":False,"AllowFrame":False},
     {"Lender":"Global Lending Services","Program":"Near/Sub","MinScore":580,"MaxScore":720,"MaxRepos":2,"MinIncome":2200,"MinDown":1000,"MaxTerm":75,"MaxMiles":150000,"MaxLTV":135,"AllowGig":True,"AllowNoDL":False,"AllowFrame":False},
     {"Lender":"Flagship Credit","Program":"Near/Sub","MinScore":600,"MaxScore":750,"MaxRepos":2,"MinIncome":2400,"MinDown":1000,"MaxTerm":75,"MaxMiles":155000,"MaxLTV":125,"AllowGig":True,"AllowNoDL":False,"AllowFrame":True},
@@ -92,7 +80,7 @@ HARD_INVENTORY = pd.DataFrame([
 ])
 
 # =======================================
-# Parse uploaded rate sheet (CSV/XLSX) -> normalized table
+# Parse uploaded rate sheet -> normalized table
 # =======================================
 @st.cache_data(show_spinner=False)
 def load_rate_sheet_from_bytes(data: bytes, ext: str) -> pd.DataFrame:
@@ -122,68 +110,6 @@ def load_rate_sheet_from_bytes(data: bytes, ext: str) -> pd.DataFrame:
     return out
 
 # =======================================
-# PDF rate sheet parsing (heuristic)
-# Extract text, try to find lines with lender name and thresholds.
-# This is intentionally conservative; you can correct in the Review table.
-# =======================================
-def parse_pdf_rates(file_bytes: bytes) -> pd.DataFrame:
-    if pdfplumber is None:
-        st.warning("pdfplumber not available. Add `pdfplumber` to requirements.txt to enable PDF import.")
-        return pd.DataFrame()
-
-    rules = []
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            for raw in text.splitlines():
-                line = re.sub(r"\s+", " ", raw).strip()
-                # Very loose match: find a lender-ish token then scan numbers/policy flags
-                # You can refine for known formats later.
-                if len(line) < 12:
-                    continue
-                # Example pattern: LENDER - Min 580 Max 720 MaxRepos 2 Income 2200 Down 1000 Term 75 Miles 150k LTV 135% Gig Y NoDL N Frame N
-                m = re.search(r"(?P<lender>[A-Z][A-Za-z0-9&.\- ]+?)\s*[-:–]\s*", line)
-                if not m:
-                    continue
-                lender = m.group("lender").strip()
-                # numbers
-                def grab(pattern, default=None, cast=float):
-                    m2 = re.search(pattern, line, flags=re.I)
-                    if not m2:
-                        return default
-                    try:
-                        val = m2.group(1).replace(",", "")
-                        if val.lower().endswith("k"):
-                            val = float(val[:-1]) * 1000.0
-                        return cast(val)
-                    except Exception:
-                        return default
-
-                item = {
-                    "Lender": lender,
-                    "Program": "POC",
-                    "MinScore": grab(r"Min\s*([0-9]{3})", None, float),
-                    "MaxScore": grab(r"Max\s*([0-9]{3})", 999, float),
-                    "MaxRepos": grab(r"repos?\s*([0-9]+)", 99, float),
-                    "MinIncome": grab(r"income\s*\$?([0-9,]+k?)", 0.0, float),
-                    "MinDown": grab(r"down\s*\$?([0-9,]+)", 0.0, float),
-                    "MaxTerm": grab(r"term\s*([0-9]{2})", 84, float),
-                    "MaxMiles": grab(r"miles?\s*([0-9,]+k?)", 200000, float),
-                    "MaxLTV": grab(r"ltv\s*([0-9]{2,3})\%?", 150, float),
-                    "AllowGig": bool(re.search(r"\bgig\s*(y|yes|allowed)\b", line, re.I)),
-                    "AllowNoDL": bool(re.search(r"\b(no\s*dl|nodl|no dl\s*ok|no d/l)\b", line, re.I)),
-                    "AllowFrame": bool(re.search(r"\b(frame|struct)\s*(ok|allow|yes)\b", line, re.I)),
-                }
-                if item["Lender"]:
-                    rules.append(item)
-
-    if not rules:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rules).drop_duplicates(subset=["Lender"]).reset_index(drop=True)
-    return df
-
-# =======================================
 # Normalize / filter inventory
 # - Keep >= $4,000
 # - Exclude stock starting with W or T
@@ -210,7 +136,7 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     work = work[~work["StockUpper"].str.startswith(("W","T"))]
     work = work.drop(columns=["StockUpper"], errors="ignore").reset_index(drop=True)
 
-    # strings
+    # make sure strings exist
     for s in ["Make","Model","Trim"]:
         if s not in work.columns:
             work[s] = ""
@@ -241,13 +167,16 @@ def gates_ok(row, features, unit=None):
     if inc_total < row["MinIncome"]:
         return False, "Income short"
 
-    desired_term = features["desired_term"]  # default 60
+    # Term (we default to desired=60; check not over lender max)
+    desired_term = features["desired_term"]
     if desired_term > row["MaxTerm"]:
         return False, "Term exceeds program max"
 
+    # DL policy
     if (not row["AllowNoDL"]) and not has_dl:
         return False, "DL required"
 
+    # Unit gates if provided
     if unit is not None:
         if unit["Miles"] > row["MaxMiles"]:
             return False, "Miles exceed program max"
@@ -262,20 +191,25 @@ def gates_ok(row, features, unit=None):
 
 def lender_fit_score(row, features):
     cred = features["credit"]
-    min_score = row["MinScore"] if row["MinScore"] is not None else cred
+    min_score = row["MinScore"] if row["MinScore"] is not None else cred  # treat current score as min if None
     mid = (min_score + row["MaxScore"]) / 2.0 if row["MinScore"] is not None else row["MaxScore"] - 20
     s = 100 - abs(cred - mid) * 0.3
     return max(0, s)
 
 def unit_fit_score(row, unit, features):
+    # prefer closer (but under) to MaxLTV, and lower miles
     down = features["down"]
     trade = features["trade_eq"]
     bv = max(unit["BookValue"], 1.0)
     adv = (unit["TotalCost"] - down - trade) / bv * 100.0
+    # score: penalty if far below or slightly above. Above triggers gate before.
     adv_score = max(0.0, 100 - abs(row["MaxLTV"] - adv))
     miles_score = max(0.0, 100 - (unit["Miles"] / max(1.0, row["MaxMiles"])) * 100)
     return adv_score * 0.6 + miles_score * 0.4, adv
 
+# =======================================
+# Deal Desk Assist (thinks like a closer)
+# =======================================
 def what_it_takes(row, features, unit):
     F = dict(features)
     term = F["desired_term"]
@@ -286,11 +220,13 @@ def what_it_takes(row, features, unit):
     changes = {}
     reasons = []
 
+    # down
     min_down_add = max(0.0, row["MinDown"] - F["down"])
     changes["down"] = F["down"] + min_down_add
     if min_down_add > 0:
         reasons.append(f"Needs at least ${int(row['MinDown'])} down (+${int(min_down_add)}).")
 
+    # LTV adjustment
     if unit is not None:
         bv = max(unit["BookValue"], 1.0)
         adv_now = (unit["TotalCost"] - changes["down"] - F["trade_eq"]) / bv * 100.0
@@ -301,15 +237,18 @@ def what_it_takes(row, features, unit):
                 changes["down"] += extra
                 reasons.append(f"Lower advance to ≤{int(row['MaxLTV'])}% (+${int(extra)} more down).")
 
+    # term
     if term > row["MaxTerm"]:
         changes["term"] = int(row["MaxTerm"])
         reasons.append(f"Max term {int(row['MaxTerm'])} months.")
     else:
         changes["term"] = term
 
+    # miles
     if unit is not None and unit["Miles"] > row["MaxMiles"]:
         reasons.append(f"Miles {int(unit['Miles'])} > {int(row['MaxMiles'])} program cap.")
 
+    # income
     inc_total = F["income"] + (F["gig_income"] if F["gig"] else 0)
     if inc_total < row["MinIncome"]:
         short = int(row["MinIncome"] - inc_total)
@@ -324,14 +263,15 @@ def what_it_takes(row, features, unit):
     if (not row["AllowNoDL"]) and features["has_dl"] == "No":
         reasons.append("DL required.")
 
+    # friction score
     fric = 0
     fric += max(0, int((changes["down"] - F["down"]) / 100.0)) * 25
     fric += max(0, int((term - changes["term"]) / 6)) * 10
     if unit is not None and unit["Miles"] > row["MaxMiles"]:
         fric += 200
-    if features["repos"] > row["MaxRepos"]:
-        fric += 150
     if inc_total < row["MinIncome"]:
+        fric += 150
+    if features["repos"] > row["MaxRepos"]:
         fric += 150
     if (not row["AllowNoDL"]) and features["has_dl"] == "No":
         fric += 150
@@ -339,6 +279,7 @@ def what_it_takes(row, features, unit):
     return {"fits": False, "changes": changes, "reasons": reasons if reasons else [why], "friction": fric}
 
 def desk_deal_assist(inventory_df, rules_df, features):
+    # try direct fits
     fits = []
     for _, u in inventory_df.iterrows():
         for _, r in rules_df.iterrows():
@@ -352,6 +293,7 @@ def desk_deal_assist(inventory_df, rules_df, features):
         score, r, u, adv = fits[0]
         return {"status":"fits_now","lender":r["Lender"],"program":r["Program"],"unit":u,"advance":adv,"reason":"Meets program without changes.","alts":fits[1:4]}
 
+    # otherwise: smallest friction across all pairs
     best = None
     for _, u in inventory_df.iterrows():
         for _, r in rules_df.iterrows():
@@ -369,7 +311,7 @@ def desk_deal_assist(inventory_df, rules_df, features):
     return best
 
 # =======================================
-# Session state
+# Session state (rate rules)
 # =======================================
 if "rate_rules" not in st.session_state:
     st.session_state["rate_rules"] = DEFAULT_RULES.copy()
@@ -378,7 +320,7 @@ if "rate_rules" not in st.session_state:
 # Header / How it works
 # =======================================
 st.title("SmartDesk — Desking Assistant")
-st.caption("Upload rate sheets (CSV/XLSX/PDF) and/or paste lenders in bulk, then desk deals with lender & unit picks. Desired term defaults to 60 mo.")
+st.caption("Upload a rate sheet and/or inventory (optional), enter the basics, and get a lender pick + structure / smallest change to get an approval.")
 
 with st.expander("What files look like", expanded=False):
     st.markdown(
@@ -389,14 +331,12 @@ with st.expander("What files look like", expanded=False):
 **Inventory (CSV/XLSX) — columns:**  
 `Stock, Year, Make, Model, Trim, Miles, TotalCost (or Price), BookValue`  
 POC filter: keeps units **≥ $4,000** and **excludes Stock starting with W or T**.
-
-**PDF import:** rough heuristic parser (you can correct in the Review table).
         """
     )
 
 # =======================================
 # LEFT: Deal input
-# RIGHT: Uploads / Manage lenders
+# RIGHT: Uploads / current rules
 # =======================================
 left, right = st.columns([1.25, 1])
 
@@ -431,107 +371,30 @@ with left:
         submitted = st.form_submit_button("Evaluate Deal", type="primary")
 
 with right:
-    st.subheader("Rate Sheets")
+    st.subheader("Uploads")
     rs_file = st.file_uploader("Rate sheet (CSV/XLSX)", type=["csv","xlsx"], key="rs")
     if rs_file is not None:
         try:
             ext = ".csv" if rs_file.name.lower().endswith(".csv") else ".xlsx"
-            parsed = load_rate_sheet_from_bytes(rs_file.read(), ext)
-            st.success(f"Parsed {len(parsed)} lenders from {rs_file.name}. Review below, then click **Merge**.")
-            st.dataframe(parsed, use_container_width=True, height=210)
-            if st.button("Merge parsed rate sheet", key="merge_rs"):
-                # merge into session rules
-                merged = pd.concat([st.session_state["rate_rules"], parsed], ignore_index=True)
-                merged = merged.drop_duplicates(subset=["Lender","Program"], keep="last").reset_index(drop=True)
-                st.session_state["rate_rules"] = merged
-                st.success(f"Merged. You now have {len(merged)} lenders in memory.")
+            st.session_state["rate_rules"] = load_rate_sheet_from_bytes(rs_file.read(), ext)
+            st.success(f"Loaded {len(st.session_state['rate_rules'])} lender rows from **{rs_file.name}**.")
         except Exception as e:
             st.error(f"Rate sheet error: {e}")
 
-    pdf_file = st.file_uploader("Rate sheet (PDF)", type=["pdf"], key="pdf")
-    if pdf_file is not None:
-        if pdfplumber is None:
-            st.warning("Install `pdfplumber` to enable PDF import.")
-        else:
-            pdf_df = parse_pdf_rates(pdf_file.read())
-            if pdf_df.empty:
-                st.warning("No lender rows recognized from this PDF (try CSV/XLSX or adjust manually below).")
-            else:
-                st.success(f"Parsed {len(pdf_df)} lenders from PDF. Review below, then click **Merge**.")
-                st.dataframe(pdf_df, use_container_width=True, height=210)
-                if st.button("Merge parsed PDF", key="merge_pdf"):
-                    merged = pd.concat([st.session_state["rate_rules"], pdf_df], ignore_index=True)
-                    merged = merged.drop_duplicates(subset=["Lender","Program"], keep="last").reset_index(drop=True)
-                    st.session_state["rate_rules"] = merged
-                    st.success(f"Merged. You now have {len(merged)} lenders in memory.")
+    inv_file = st.file_uploader("Inventory (CSV/XLSX)", type=["csv","xlsx"], key="inv")
 
-    st.subheader("Bulk Add / Edit")
-    st.caption("Paste CSV with header row. Columns (case-insensitive): Lender, Program, MinScore, MaxScore, MaxRepos, MinIncome, MinDown, MaxTerm, MaxMiles, MaxLTV, AllowGig, AllowNoDL, AllowFrame.")
-    sample = "Lender,Program,MinScore,MaxScore,MaxRepos,MinIncome,MinDown,MaxTerm,MaxMiles,MaxLTV,AllowGig,AllowNoDL,AllowFrame\n" \
-             "AmeriCredit,Near/Sub,580,740,2,2200,1000,75,150000,130,Yes,No,No"
-    paste = st.text_area("Paste lenders (CSV)", sample, height=120)
-    if st.button("Preview pasted CSV"):
-        try:
-            buf = BytesIO(paste.encode("utf-8"))
-            dfp = pd.read_csv(buf)
-            st.dataframe(dfp, use_container_width=True, height=210)
-            st.session_state["bulk_preview"] = dfp
-        except Exception as e:
-            st.error(f"Parse error: {e}")
-
-    if st.button("Merge pasted lenders"):
-        dfp = st.session_state.get("bulk_preview")
-        if dfp is None or dfp.empty:
-            st.warning("Nothing to merge. Click 'Preview' first.")
-        else:
-            # normalize columns like our loader
-            low = {c.lower().strip(): c for c in dfp.columns}
-            def col(name, default=None):
-                c = low.get(name)
-                return dfp[c] if c else [default]*len(dfp)
-            merged_in = pd.DataFrame({
-                "Lender": col("lender","").astype(str).str.strip(),
-                "Program": col("program","POC").astype(str).str.strip(),
-                "MinScore": [ _num(x, None) for x in col("minscore", None) ],
-                "MaxScore": [ _num(x, 999) for x in col("maxscore", 999) ],
-                "MaxRepos": [ _num(x, 99) for x in col("maxrepos", 99) ],
-                "MinIncome": [ _num(x, 0) for x in col("minincome", 0) ],
-                "MinDown": [ _num(x, 0) for x in col("mindown", 0) ],
-                "MaxTerm": [ _num(x, 84) for x in col("maxterm", 84) ],
-                "MaxMiles": [ _num(x, 200000) for x in col("maxmiles", 200000) ],
-                "MaxLTV": [ _num(x, 150) for x in col("maxltv", 150) ],
-                "AllowGig": [ _to_bool(x, True) for x in col("allowgig","Yes") ],
-                "AllowNoDL": [ _to_bool(x, False) for x in col("allownodl","No") ],
-                "AllowFrame": [ _to_bool(x, False) for x in col("allowframe","No") ],
-            })
-            merged_in = merged_in[merged_in["Lender"]!=""].reset_index(drop=True)
-            merged = pd.concat([st.session_state["rate_rules"], merged_in], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["Lender","Program"], keep="last").reset_index(drop=True)
-            st.session_state["rate_rules"] = merged
-            st.success(f"Added {len(merged_in)} lenders. Total now: {len(merged)}.")
-
-# =======================================
-# Manage / Export lenders
-# =======================================
-with st.expander("Manage lenders (search/export)"):
-    q = st.text_input("Search lender/program")
-    view = st.session_state["rate_rules"].copy()
-    if q.strip():
-        hay = view.apply(lambda r: " ".join(str(v) for v in r.values), axis=1).str.lower()
-        view = view[hay.str.contains(q.strip().lower(), na=False)]
-    st.dataframe(view, use_container_width=True)
-    csv = view.to_csv(index=False).encode("utf-8")
-    st.download_button("Export filtered lenders (CSV)", csv, "lenders_export.csv", "text/csv")
+    with st.expander("Current Rate Rules (top 20)", expanded=False):
+        st.dataframe(st.session_state["rate_rules"].head(20), use_container_width=True)
 
 # =======================================
 # Ask about a lender rule (quick search)
 # =======================================
 st.subheader("Ask about a lender rule")
-rule_q = st.text_input("Example: Does Exeter allow frame damage? Or Gateway gig income?")
-if rule_q.strip():
+q = st.text_input("Example: Does Exeter allow frame damage? or Gateway gig income?")
+if q.strip():
     rules = st.session_state["rate_rules"].copy()
     hay = rules.apply(lambda r: " ".join(str(v) for v in r.values), axis=1).str.lower()
-    hits = rules[hay.str.contains(rule_q.strip().lower(), na=False)]
+    hits = rules[hay.str.contains(q.strip().lower(), na=False)]
     if hits.empty:
         st.info("No obvious matches in the current rate table.")
     else:
@@ -540,15 +403,8 @@ if rule_q.strip():
 # =======================================
 # Evaluate Deal
 # =======================================
-st.markdown("---")
-st.subheader("Desk this deal")
-
-if "inv_choice" not in st.session_state:
-    st.session_state["inv_choice"] = None
-
-inv_file = st.file_uploader("Inventory (CSV/XLSX) (optional)", type=["csv","xlsx"], key="inv_main")
-
-if st.button("Evaluate Deal", type="primary", use_container_width=False):
+if submitted:
+    # features – Desired Term is not asked; default 60 mo for structure checks
     features = {
         "credit": credit,
         "income": monthly_income,
@@ -561,12 +417,13 @@ if st.button("Evaluate Deal", type="primary", use_container_width=False):
         "down": float(down),
         "trade_eq": float(trade_eq),
         "desired_term": 60,  # default since input removed
-        "co_score": None,
-        "co_income": 0,
+        "co_score": co_score,
+        "co_income": co_income,
     }
 
     # rules
     rules = st.session_state["rate_rules"].copy()
+    # ensure numeric/bool types
     num_cols = ["MinScore","MaxScore","MaxRepos","MinIncome","MinDown","MaxTerm","MaxMiles","MaxLTV"]
     for c in num_cols:
         if c in rules.columns:
@@ -576,7 +433,7 @@ if st.button("Evaluate Deal", type="primary", use_container_width=False):
         if c in rules.columns:
             rules[c] = rules[c].apply(lambda x: _to_bool(x, False))
 
-    # inventory
+    # inventory: uploaded or hard-coded POC
     if inv_file is not None:
         try:
             ext = ".csv" if inv_file.name.lower().endswith(".csv") else ".xlsx"
@@ -628,7 +485,7 @@ if st.button("Evaluate Deal", type="primary", use_container_width=False):
                 st.markdown("**Why:**  \n- " + "\n- ".join(plan["reasons"]))
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # quick talking points
+        # quick call-in talking points
         st.markdown("### Call-in summary")
         buyer_pitch = [
             "Why this car and structure fits (book/advance/miles).",
