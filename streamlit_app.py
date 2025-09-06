@@ -69,8 +69,6 @@ def load_rate_sheet_from_bytes(data: bytes, ext: str) -> pd.DataFrame:
     else:
         raw = pd.read_excel(BytesIO(data))
 
-    # columns: Lender, Program, MinScore, MaxScore, MaxRepos, MinJobMonths, MinIncome, MinDown,
-    #          MaxLTV, MaxMiles, MaxTerm, AllowGig, AllowNoDL, AllowFrame
     out = pd.DataFrame({
         "Lender": pick_or_default(colget(raw, "lender"), ""),
         "Program": pick_or_default(colget(raw, "program"), ""),
@@ -103,7 +101,6 @@ def load_rate_sheet_from_bytes(data: bytes, ext: str) -> pd.DataFrame:
 # Default rules (pre-seed)
 # =========================
 DEFAULT_RULES = pd.DataFrame([
-    # Sub/near-prime (no MinScore on Gateway, Exeter, CPS)
     {"Lender":"Gateway Financial Solutions","Program":"Standard",
      "MinScore":None,"MaxScore":750,"MaxRepos":2,"MinJobMonths":3,"MinIncome":1800,"MinDown":500,
      "MaxLTV":125,"MaxMiles":165000,"MaxTerm":75,"AllowGig":True,"AllowNoDL":False,"AllowFrame":False},
@@ -152,7 +149,6 @@ DEFAULT_RULES = pd.DataFrame([
      "MinScore":580,"MaxScore":760,"MaxRepos":2,"MinJobMonths":6,"MinIncome":2200,"MinDown":500,
      "MaxLTV":125,"MaxMiles":160000,"MaxTerm":75,"AllowGig":True,"AllowNoDL":False,"AllowFrame":False},
 
-    # Prime/CU style
     {"Lender":"Kemba CU","Program":"Prime",
      "MinScore":640,"MaxScore":850,"MaxRepos":0,"MinJobMonths":12,"MinIncome":3000,"MinDown":1000,
      "MaxLTV":110,"MaxMiles":120000,"MaxTerm":72,"AllowGig":False,"AllowNoDL":False,"AllowFrame":False},
@@ -171,23 +167,22 @@ if "rate_rules" not in st.session_state:
 
 # =========================
 # Hard-coded inventory (demo)
-# Filter: TotalCost >= 4000; exclude Stock starting with W/T
+# Filters: TotalCost >= 4000; exclude Stock starting with W or T
 # =========================
 HARD_INVENTORY = pd.DataFrame([
     {"Stock":"A001","Year":2016,"Make":"Chevrolet","Model":"Equinox","Trim":"LT","Miles":93580,"TotalCost":9990,"BookValue":11800},
     {"Stock":"A002","Year":2017,"Make":"Ford","Model":"Edge","Trim":"SEL","Miles":102300,"TotalCost":10450,"BookValue":12200},
     {"Stock":"A003","Year":2014,"Make":"Toyota","Model":"Camry","Trim":"SE","Miles":128590,"TotalCost":8495,"BookValue":10250},
-    {"Stock":"W100","Year":2016,"Make":"VW","Model":"Jetta","Trim":"S","Miles":98000,"TotalCost":3990,"BookValue":9100},   # filtered by W & < 4000
-    {"Stock":"T200","Year":2016,"Make":"Toyota","Model":"RAV4","Trim":"LE","Miles":99000,"TotalCost":13990,"BookValue":15800}, # filtered by T prefix
+    {"Stock":"W100","Year":2016,"Make":"VW","Model":"Jetta","Trim":"S","Miles":98000,"TotalCost":3990,"BookValue":9100},   # filtered
+    {"Stock":"T200","Year":2016,"Make":"Toyota","Model":"RAV4","Trim":"LE","Miles":99000,"TotalCost":13990,"BookValue":15800}, # filtered
     {"Stock":"A004","Year":2015,"Make":"Nissan","Model":"Altima","Trim":"2.5 S","Miles":119400,"TotalCost":7795,"BookValue":9300},
     {"Stock":"A005","Year":2014,"Make":"Dodge","Model":"Journey","Trim":"SXT","Miles":111200,"TotalCost":8995,"BookValue":10600},
-    {"Stock":"B006","Year":2011,"Make":"Kia","Model":"Soul","Trim":"Base","Miles":171500,"TotalCost":3390,"BookValue":4200},   # filtered by < 4000
+    {"Stock":"B006","Year":2011,"Make":"Kia","Model":"Soul","Trim":"Base","Miles":171500,"TotalCost":3390,"BookValue":4200},   # filtered
     {"Stock":"A007","Year":2018,"Make":"Hyundai","Model":"Elantra","Trim":"SE","Miles":88500,"TotalCost":10990,"BookValue":12500},
     {"Stock":"A008","Year":2013,"Make":"Honda","Model":"CR-V","Trim":"EX","Miles":142000,"TotalCost":9990,"BookValue":11750},
 ])
 
 def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
-    # try to map user headers
     mapping_candidates = {
         "Stock": ["stock","stk","stocknumber","stock_no","stock#"],
         "Year": ["year","yr"],
@@ -205,29 +200,21 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
         for a in [key.lower()] + aliases:
             if a in lower_cols: found = lower_cols[a]; break
         if found is None:
-            # backfill with defaults
             if key in ("Trim",): out[key] = ""
             else: out[key] = None
         else:
             out[key] = df[found]
 
-    # numeric clean
     for c in ["Year","Miles","TotalCost","BookValue"]:
         out[c] = [clean_num(v, 0) for v in out[c]]
 
     out["Stock"] = out["Stock"].astype(str)
 
-    # required filters:
-    # 1) TotalCost >= 4000
-    # 2) exclude stock starting with W or T
     mask_price = out["TotalCost"] >= 4000
     mask_stock = ~out["Stock"].str.upper().str.startswith(tuple(["W","T"]))
     out = out[mask_price & mask_stock].reset_index(drop=True)
 
-    # drop blanks
     out = out[out["Make"].astype(str).str.strip()!=""].reset_index(drop=True)
-
-    # compute spread
     out["BookSpread"] = out["BookValue"] - out["TotalCost"]
     return out
 
@@ -235,11 +222,6 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
 # Lender gating & scoring
 # =========================
 def gates_ok(row, features, unit):
-    """
-    row  : lender rule row (Series)
-    unit : vehicle row (Series) or None (when only checking lender for person)
-    features: dict with credit, income, job_months, repos, down, trade_eq, term, miles, advance calc, etc.
-    """
     cred = features["credit"]
     income = features["income"]
     job = features["job_months"]
@@ -250,23 +232,21 @@ def gates_ok(row, features, unit):
     gig_income = features["gig_income"]
     term = features["desired_term"]
 
-    # Score window
-    if row["MinScore"] is not None and cred < float(row["MinScore"]): return (False, "Below min score")
-    if row["MaxScore"] is not None and cred > float(row["MaxScore"]): return (False, "Above max score")
+    # NOTE: use pd.notna for score bounds so NaN acts as "no bound"
+    if pd.notna(row["MinScore"]) and cred < float(row["MinScore"]): return (False, "Below min score")
+    if pd.notna(row["MaxScore"]) and cred > float(row["MaxScore"]): return (False, "Above max score")
 
     if repos > float(row["MaxRepos"]): return (False, "Too many repos")
     if job < float(row["MinJobMonths"]): return (False, "Not enough job time")
     if income + (gig_income if gig else 0) < float(row["MinIncome"]): return (False, "Not enough income")
     if down < float(row["MinDown"]): return (False, "Needs more down")
-    if not row["AllowNoDL"] and has_dl == "No": return (False, "DL required")
-    if not row["AllowGig"] and gig and gig_income > 0: return (False, "Gig income not allowed")
+    if not bool(row["AllowNoDL"]) and has_dl == "No": return (False, "DL required")
+    if not bool(row["AllowGig"]) and gig and gig_income > 0: return (False, "Gig income not allowed")
 
     if unit is not None:
-        # unit-specific gates
         if unit["Miles"] > float(row["MaxMiles"]): return (False, "Miles over program limit")
         if term > float(row["MaxTerm"]): return (False, "Term over program max")
 
-        # Advance/LTV ~ (Sale - down - trade) / Book * 100
         bv = max(unit["BookValue"], 1.0)
         advance = max(0.0, (unit["TotalCost"] - down - features["trade_eq"]) / bv * 100.0)
         if advance > float(row["MaxLTV"]): return (False, f"Advance {advance:.0f}% > max {row['MaxLTV']:.0f}%")
@@ -274,19 +254,17 @@ def gates_ok(row, features, unit):
     return (True, "Meets program")
 
 def lender_fit_score(row, features):
-    """Soft score ignoring unit (for 'top lenders' list)"""
     cred = features["credit"]
     income = features["income"] + (features["gig_income"] if features["gig"] else 0)
     down = features["down"]
     job = features["job_months"]
 
-    # center in score window if provided
     score = 0.0
-    if row["MinScore"] is None and row["MaxScore"] is None:
+    if pd.isna(row["MinScore"]) and pd.isna(row["MaxScore"]):
         score += 50
     else:
-        lo = 0 if row["MinScore"] is None else float(row["MinScore"])
-        hi = 850 if row["MaxScore"] is None else float(row["MaxScore"])
+        lo = 0 if pd.isna(row["MinScore"]) else float(row["MinScore"])
+        hi = 850 if pd.isna(row["MaxScore"]) else float(row["MaxScore"])
         mid = (lo + hi) / 2.0
         score += max(0.0, 100.0 - abs(cred - mid) * 0.4)
 
@@ -294,29 +272,23 @@ def lender_fit_score(row, features):
     score += min(5000.0, income) / 50.0
     score += min(120.0, job) / 4.0
     score += 12.0 if (features["has_dl"] == "Yes") else 0.0
-    score += 8.0 if (features["gig"] and row["AllowGig"]) else 0.0
+    score += 8.0 if (features["gig"] and bool(row["AllowGig"])) else 0.0
     return round(score, 1)
 
 def unit_fit_score(row, unit, features):
-    """Soft score for unit within lender program (higher=better)"""
-    # Advance / LTV
     bv = max(unit["BookValue"], 1.0)
     advance = max(0.0, (unit["TotalCost"] - features["down"] - features["trade_eq"]) / bv * 100.0)
     over = max(0.0, advance - float(row["MaxLTV"]))
-    adv_score = max(0.0, 80.0 - over * 2.0)  # penalize exceeding cap
+    adv_score = max(0.0, 80.0 - over * 2.0)
 
-    # Miles penalty
     mile_over = max(0.0, unit["Miles"] - float(row["MaxMiles"]))
     miles_score = max(0.0, 50.0 - mile_over / 3000.0)
 
-    # Book spread (bigger spread = better)
     spread_score = max(0.0, min(40.0, (unit["BookValue"] - unit["TotalCost"]) / 200.0))
 
-    # Price sanity (prefer cars 6k - 16k window)
     price = unit["TotalCost"]
     price_score = max(0.0, 30.0 - abs(price - 11000.0) / 700.0)
 
-    # Combine
     score = adv_score + miles_score + spread_score + price_score
     return round(score, 1), advance
 
@@ -340,7 +312,7 @@ def best_units(inventory_df, rules_df, features, topn=5):
         best_adv = None
         for _, r in rules_df.iterrows():
             ok, _ = gates_ok(r, features, unit)
-            if not ok: 
+            if not ok:
                 continue
             s, adv = unit_fit_score(r, unit, features)
             if (best is None) or (s > best):
@@ -412,7 +384,7 @@ with col_left:
             job_years = st.number_input("Job Time (years)", 0, 50, 0, 1)
             job_months_extra = st.number_input("Job Time (months)", 0, 11, 6, 1)
 
-        desired_term = st.number_input("Desired Term (months)", 24, 84, 60, 1)
+        # Removed Desired Term input; we use a sensible default below
 
         include_co = st.checkbox("Include Co-Applicant?")
         if include_co:
@@ -478,6 +450,9 @@ if q.strip():
 # Evaluate
 # =========================
 if submitted:
+    # Default desired term to 60 months (no input)
+    DEFAULT_TERM = 60
+
     features = {
         "credit": int(credit),
         "income": float(income) + (float(co_income) if include_co else 0.0),
@@ -488,7 +463,7 @@ if submitted:
         "gig": bool(gig_flag),
         "gig_income": float(gig_income),
         "has_dl": has_dl,
-        "desired_term": int(desired_term),
+        "desired_term": DEFAULT_TERM,
         "co_score": None if co_score is None else int(co_score),
         "co_income": float(co_income),
     }
@@ -519,7 +494,6 @@ if submitted:
             st.dataframe(best_u[show_cols], use_container_width=True, height=260)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Snapshot
     st.markdown("### Deal Snapshot")
     snapshot = {
         "Primary Applicant": {
@@ -532,7 +506,8 @@ if submitted:
         "Structure": {
             "Down Payment": features["down"],
             "Trade Equity": features["trade_eq"],
-            "Gig Income": features["gig_income"] if features["gig"] else 0
+            "Gig Income": features["gig_income"] if features["gig"] else 0,
+            "Desired Term": DEFAULT_TERM
         },
         "Co-Applicant": {
             "Included": include_co,
