@@ -1,12 +1,11 @@
 # streamlit_app.py
 import re
+import streamlit as st
+import pandas as pd
+import numpy as np
 from io import BytesIO
 
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-# Optional: PDF support (install pdfplumber in requirements.txt)
+# ---------- Optional (PDF parsing) ----------
 try:
     import pdfplumber
     PDF_OK = True
@@ -22,11 +21,12 @@ st.markdown(
     <style>
       .card {border-radius:10px;padding:14px 16px;border:1px solid rgba(250,250,250,.12);background:rgba(250,250,250,.03)}
       .metric {font-size:26px;font-weight:700;margin-bottom:4px}
-      .em {opacity:.7}
+      .em {opacity:.75}
       .ok {color:#7DD97C}
       .warn {color:#F2C14E}
       .bad {color:#EF6C6C}
       .tight p {margin:0}
+      .banner {padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04);margin-bottom:8px}
     </style>
     """,
     unsafe_allow_html=True
@@ -37,7 +37,7 @@ st.markdown(
 # =========================
 def _to_bool(x, default=False):
     if isinstance(x, str):
-        return x.strip().lower() in ("y","yes","true","1","ok","allowed")
+        return x.strip().lower() in ("y","yes","true","1","ok","allow","allowed")
     if isinstance(x, (int, float, np.integer, np.floating)):
         return bool(x)
     return default
@@ -61,7 +61,7 @@ def clamp(v, lo, hi):
         return v
 
 # =========================
-# Default (POC) lender programs
+# Default rules (POC)
 # =========================
 DEFAULT_RULES = pd.DataFrame([
     {"Lender":"Gateway Financial Solutions","Program":"Near/Sub","MinScore":None,"MaxScore":700,"MaxRepos":2,"MinIncome":2000,"MinDown":500,"MaxTerm":72,"MaxMiles":160000,"MaxLTV":130,"AllowGig":True,"AllowNoDL":False,"AllowFrame":False},
@@ -74,23 +74,23 @@ DEFAULT_RULES = pd.DataFrame([
 ])
 
 # =========================
-# POC Hard Inventory (filtered later)
+# POC hard inventory (filtered later)
 # =========================
 HARD_INVENTORY = pd.DataFrame([
     {"Stock":"A001","Year":2016,"Make":"Chevrolet","Model":"Equinox","Trim":"LT","Miles":93500,"TotalCost":9990,"BookValue":11800},
     {"Stock":"A002","Year":2017,"Make":"Ford","Model":"Edge","Trim":"SEL","Miles":102300,"TotalCost":10450,"BookValue":12200},
     {"Stock":"A003","Year":2014,"Make":"Toyota","Model":"Camry","Trim":"SE","Miles":128500,"TotalCost":8495,"BookValue":10250},
     {"Stock":"A004","Year":2015,"Make":"Nissan","Model":"Altima","Trim":"2.5 S","Miles":119400,"TotalCost":7795,"BookValue":9300},
-    {"Stock":"X005","Year":2010,"Make":"Dodge","Model":"Journey","Trim":"SXT","Miles":111200,"TotalCost":8995,"BookValue":10600},  # excluded by stock prefix
-    {"Stock":"W100","Year":2016,"Make":"Volkswagen","Model":"Jetta","Trim":"S","Miles":98800,"TotalCost":7990,"BookValue":9100},   # excluded by stock prefix
-    {"Stock":"T200","Year":2016,"Make":"Toyota","Model":"RAV4","Trim":"LE","Miles":99000,"TotalCost":13990,"BookValue":15800},   # excluded by stock prefix
+    {"Stock":"X005","Year":2010,"Make":"Dodge","Model":"Journey","Trim":"SXT","Miles":111200,"TotalCost":8995,"BookValue":10600},  # excluded by stock prefix rule
+    {"Stock":"W100","Year":2016,"Make":"Volkswagen","Model":"Jetta","Trim":"S","Miles":98800,"TotalCost":7990,"BookValue":9100},   # excluded by stock prefix rule
+    {"Stock":"T200","Year":2016,"Make":"Toyota","Model":"RAV4","Trim":"LE","Miles":99000,"TotalCost":13990,"BookValue":15800},   # excluded by stock prefix rule
     {"Stock":"B006","Year":2011,"Make":"Kia","Model":"Soul","Trim":"Base","Miles":171500,"TotalCost":3390,"BookValue":4200},     # excluded by price
     {"Stock":"A007","Year":2018,"Make":"Hyundai","Model":"Elantra","Trim":"SEL","Miles":84500,"TotalCost":10990,"BookValue":12500},
     {"Stock":"A008","Year":2019,"Make":"Nissan","Model":"Versa","Trim":"SV","Miles":61200,"TotalCost":9995,"BookValue":11200},
 ])
 
 # =========================
-# Rate sheet loaders (CSV/XLSX/PDF)
+# Rate-sheet loaders
 # =========================
 @st.cache_data(show_spinner=False)
 def load_rate_sheet_from_bytes(data: bytes, ext: str) -> pd.DataFrame:
@@ -129,79 +129,64 @@ def parse_rate_pdf(pdf_bytes: bytes) -> pd.DataFrame:
 
     KNOWN_LENDERS = [
         "Gateway Financial Solutions","Global Lending Services","Flagship Credit",
-        "Regional Acceptance","Prestige","Exeter","Kemba","Kemba CU",
-        "CPS","Credit Acceptance","Santander","Westlake","AmeriCredit","GM Financial",
+        "Regional Acceptance","Prestige","Exeter","Kemba","Kemba CU","CPS",
+        "Credit Acceptance","Santander","Westlake","AmeriCredit","GM Financial",
         "United Auto Credit","Ally","Capital One"
     ]
     rows = []
     for block in re.split(r"\n\s*\n", text):
         b = block.strip()
-        if not b:
-            continue
+        if not b: continue
         lender = None
         m = re.search(r"lender\s*[:\-]\s*(.+)", b, flags=re.I)
-        if m:
-            lender = m.group(1).strip()
+        if m: lender = m.group(1).strip()
         else:
             for name in KNOWN_LENDERS:
                 if re.search(re.escape(name), b, flags=re.I):
-                    lender = name
-                    break
-        if not lender:
-            continue
+                    lender = name; break
+        if not lender: continue
 
-        def find_num(pattern, default=None, coerce_int=False):
-            m = re.search(pattern, b, flags=re.I)
-            if not m: 
-                return default
+        def cap_num(pat, default=None, as_int=False):
+            m = re.search(pat, b, flags=re.I)
+            if not m: return default
             v = _num(m.group(1).replace(",",""), default)
-            return int(v) if (coerce_int and v is not None) else v
-
-        min_score = find_num(r"(?:min(?:imum)?\s*score).*?(\d{2,3})", None, True)
-        max_score = find_num(r"(?:max(?:imum)?\s*score).*?(\d{2,3})", 999, True)
-        max_repos = find_num(r"(?:max(?:imum)?\s*repos?).*?(\d+)", 99, True)
-        min_income = find_num(r"(?:min(?:imum)?\s*income).*?\$?([\d,]+)", 0, True)
-        min_down = find_num(r"(?:min(?:imum)?\s*down).*?\$?([\d,]+)", 0, True)
-        max_term = find_num(r"(?:max(?:imum)?\s*term).*?(\d{2,3})", 84, True)
-        max_miles = find_num(r"(?:max(?:imum)?\s*(?:miles|mileage)).*?([\d,]+)", 200000, True)
-        max_ltv = find_num(r"(?:max(?:imum)?\s*(?:ltv|advance)).*?(\d{2,3})\s*%", 150, True)
-
-        allow_gig   = bool(re.search(r"\b(gig|doordash|uber|lyft)\b.*?(ok|allow|yes)", b, flags=re.I))
-        allow_nodl  = bool(re.search(r"(no\s*dl|without\s*dl).*(ok|allow|yes)", b, flags=re.I))
-        allow_frame = bool(re.search(r"frame\s*(?:damage)?\s*(ok|allow|yes)", b, flags=re.I))
+            return int(v) if (as_int and v is not None) else v
 
         rows.append({
-            "Lender": lender, "Program": "PDF",
-            "MinScore": min_score, "MaxScore": max_score, "MaxRepos": max_repos,
-            "MinIncome": min_income, "MinDown": min_down, "MaxTerm": max_term,
-            "MaxMiles": max_miles, "MaxLTV": max_ltv,
-            "AllowGig": allow_gig, "AllowNoDL": allow_nodl, "AllowFrame": allow_frame
+            "Lender": lender,
+            "Program": "PDF",
+            "MinScore": cap_num(r"(?:min(?:imum)?\s*score).*?(\d{2,3})", None, True),
+            "MaxScore": cap_num(r"(?:max(?:imum)?\s*score).*?(\d{2,3})", 999, True),
+            "MaxRepos": cap_num(r"(?:max(?:imum)?\s*repos?).*?(\d+)", 99, True),
+            "MinIncome": cap_num(r"(?:min(?:imum)?\s*income).*?\$?([\d,]+)", 0, True),
+            "MinDown": cap_num(r"(?:min(?:imum)?\s*down).*?\$?([\d,]+)", 0, True),
+            "MaxTerm": cap_num(r"(?:max(?:imum)?\s*term).*?(\d{2,3})", 84, True),
+            "MaxMiles": cap_num(r"(?:max(?:imum)?\s*(?:miles|mileage)).*?([\d,]+)", 200000, True),
+            "MaxLTV": cap_num(r"(?:max(?:imum)?\s*(?:ltv|advance)).*?(\d{2,3})\s*%", 150, True),
+            "AllowGig": bool(re.search(r"\b(gig|doordash|uber|lyft)\b.*?(ok|allow|yes)", b, flags=re.I)),
+            "AllowNoDL": bool(re.search(r"(no\s*dl|without\s*dl).*(ok|allow|yes)", b, flags=re.I)),
+            "AllowFrame": bool(re.search(r"frame\s*(?:damage)?\s*(ok|allow|yes)", b, flags=re.I)),
         })
     out = pd.DataFrame(rows)
     return out[out["Lender"].astype(str).str.strip()!=""].reset_index(drop=True)
 
 def merge_rules(base: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-    if new is None or new.empty:
-        return base.copy()
+    if new is None or new.empty: return base.copy()
     union = base.copy()
     for _, r in new.iterrows():
         name = str(r["Lender"]).strip()
-        if not name:
-            continue
-        mask = union["Lender"].astype(str).str.strip().str.lower() == name.lower()
+        if not name: continue
+        mask = union["Lender"].astype(str).str.strip().str.lower()==name.lower()
         if not mask.any():
             union = pd.concat([union, pd.DataFrame([r])], ignore_index=True)
         else:
             idx = union.index[mask][0]
             for c in new.columns:
-                if c == "Lender": 
-                    continue
+                if c=="Lender": continue
                 val = r[c]
-                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                if val is not None and not (isinstance(val,float) and np.isnan(val)):
                     union.at[idx, c] = val
-    # coerce dtypes
-    num_cols = ["MinScore","MaxScore","MaxRepos","MinIncome","MinDown","MaxTerm","MaxMiles","MaxLTV"]
-    for c in num_cols:
+    for c in ["MinScore","MaxScore","MaxRepos","MinIncome","MinDown","MaxTerm","MaxMiles","MaxLTV"]:
         if c in union.columns:
             union[c] = union[c].apply(lambda x: _num(x, 0 if c!="MaxScore" else 999))
     for c in ["AllowGig","AllowNoDL","AllowFrame"]:
@@ -212,9 +197,8 @@ def merge_rules(base: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     return union.reset_index(drop=True)
 
 # =========================
-# Inventory normalization & filters
-# - Keep TotalCost >= $4,000
-# - Exclude Stock starting with W or T
+# Inventory normalization
+# (≥ $4,000 and exclude Stock starting W/T)
 # =========================
 def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
@@ -233,13 +217,36 @@ def normalize_inventory(df: pd.DataFrame) -> pd.DataFrame:
     work = work[~work["StockUpper"].str.startswith(("W","T"))]
     work = work.drop(columns=["StockUpper"], errors="ignore").reset_index(drop=True)
     for s in ["Make","Model","Trim"]:
-        if s not in work.columns:
-            work[s] = ""
+        if s not in work.columns: work[s] = ""
         work[s] = work[s].astype(str)
     return work
 
 # =========================
-# Fit / Desk logic
+# Price at Cap helpers
+# =========================
+def compute_sell_price(row, unit, features):
+    """
+    Price at lender MaxLTV:
+      Sell = (MaxLTV% * Book) + Down + Trade
+    Fallback to inventory cost if that results below cost.
+    """
+    base_price = float(unit["TotalCost"])
+    max_ltv = float(row["MaxLTV"])
+    book = max(float(unit["BookValue"]), 1.0)
+    down = float(features["down"])
+    trade = float(features["trade_eq"])
+    sell = (max_ltv/100.0) * book + down + trade
+    return max(sell, base_price)
+
+def compute_advance_pct(row, unit, features):
+    sell = compute_sell_price(row, unit, features)
+    book = max(float(unit["BookValue"]), 1.0)
+    down = float(features["down"])
+    trade = float(features["trade_eq"])
+    return (sell - down - trade) / book * 100.0, sell
+
+# =========================
+# Fit / Scoring / Deal Desk
 # =========================
 def gates_ok(row, features, unit=None):
     cred = features["credit"]
@@ -251,26 +258,17 @@ def gates_ok(row, features, unit=None):
     desired_term = features["desired_term"]
 
     min_score = row["MinScore"] if row["MinScore"] is not None else -9999
-    if not (min_score <= cred <= row["MaxScore"]):
-        return False, "Score out of window"
-    if repos > row["MaxRepos"]:
-        return False, "Too many repos"
-    if inc_total < row["MinIncome"]:
-        return False, "Income short"
-    if desired_term > row["MaxTerm"]:
-        return False, "Term exceeds program max"
-    if (not row["AllowNoDL"]) and (not has_dl):
-        return False, "DL required"
+    if not (min_score <= cred <= row["MaxScore"]): return False, "Score out of window"
+    if repos > row["MaxRepos"]: return False, "Too many repos"
+    if inc_total < row["MinIncome"]: return False, "Income short"
+    if desired_term > row["MaxTerm"]: return False, "Term exceeds program max"
+    if (not row["AllowNoDL"]) and (not has_dl): return False, "DL required"
 
     if unit is not None:
-        if unit["Miles"] > row["MaxMiles"]:
-            return False, "Miles exceed program max"
-        if down < row["MinDown"]:
-            return False, "More down required"
-        bv = max(unit["BookValue"], 1.0)
-        adv = (unit["TotalCost"] - down - trade) / bv * 100.0
-        if adv > row["MaxLTV"]:
-            return False, f"Advance {adv:.1f}% over max {row['MaxLTV']:.0f}%"
+        if unit["Miles"] > row["MaxMiles"]: return False, "Miles exceed program max"
+        if down < row["MinDown"]: return False, "More down required"
+        adv, sell = compute_advance_pct(row, unit, features)
+        if adv > row["MaxLTV"]: return False, f"Advance {adv:.1f}% over max {row['MaxLTV']:.0f}%"
     return True, "Meets program"
 
 def lender_fit_score(row, features):
@@ -282,34 +280,35 @@ def lender_fit_score(row, features):
 
 def unit_fit_score(row, unit, features):
     """Higher is better. In aggressive mode, reward high advance & long term."""
-    down = features["down"]
-    trade = features["trade_eq"]
-    bv = max(unit["BookValue"], 1.0)
-    adv = (unit["TotalCost"] - down - trade) / bv * 100.0
+    adv, sell = compute_advance_pct(row, unit, features)
     adv_gap = abs(row["MaxLTV"] - adv)
-    adv_score = max(0.0, 100 - adv_gap)  # closer to MaxLTV = better
+    adv_score = max(0.0, 100 - adv_gap)  # closer to MaxLTV is better
 
-    if features.get("aggressive"):
+    if features.get("aggressive", True):
         term_pref = features.get("desired_term", 60)
         term_score = 100.0 * clamp(min(row["MaxTerm"], term_pref) / max(1.0, row["MaxTerm"]), 0, 1)
-        w_adv, w_term, w_miles = 0.65, 0.25, 0.10
+        w_adv, w_term, w_miles, w_gross = 0.60, 0.25, 0.10, 0.05
     else:
         term_score = 60.0
-        w_adv, w_term, w_miles = 0.60, 0.15, 0.25
+        w_adv, w_term, w_miles, w_gross = 0.55, 0.15, 0.25, 0.05
 
     miles_score = max(0.0, 100 - (unit["Miles"] / max(1.0, row["MaxMiles"])) * 100)
 
-    total = adv_score * w_adv + term_score * w_term + miles_score * w_miles
-    return total, adv
+    # light gross incentive (sell-at-cap minus cost)
+    gross = sell - float(unit["TotalCost"])
+    gross_score = max(0.0, min(100.0, gross / 100.0))  # every $100 front ≈ +1pt, capped
+
+    total = adv_score * w_adv + term_score * w_term + miles_score * w_miles + gross_score * w_gross
+    return total, adv, sell, gross
 
 def what_it_takes(row, features, unit):
     F = dict(features)
     term_in = F["desired_term"]
 
-    # Aggressive: target lender edges
-    if F.get("aggressive"):
+    # Aggressive: push to lender edges (max term), price will already be at cap via compute_* helpers
+    if F.get("aggressive", True):
         target_term = int(row["MaxTerm"])
-        target_down = float(row["MinDown"])
+        target_down = max(float(F["down"]), float(row["MinDown"]))
     else:
         target_term = min(term_in, int(row["MaxTerm"]))
         target_down = max(float(F["down"]), float(row["MinDown"]))
@@ -317,26 +316,31 @@ def what_it_takes(row, features, unit):
     changes = {"term": target_term, "down": target_down}
     reasons = []
 
-    # Re-check base gates (without unit specifics)
-    temp = dict(F); temp["desired_term"] = target_term
-    ok, why = gates_ok(row, temp, None)
-    if not ok:
-        reasons.append(why)
+    temp = dict(F)
+    temp["desired_term"] = target_term
+    ok, why = gates_ok(row, temp, unit)
+    if unit is None:
+        return {"fits": ok, "changes": changes, "reasons": [] if ok else [why], "friction": 0 if ok else 200}
 
-    if unit is not None:
-        if unit["Miles"] > row["MaxMiles"]:
-            reasons.append(f"Miles {int(unit['Miles'])} > {int(row['MaxMiles'])} program cap.")
+    # Miles
+    if unit["Miles"] > row["MaxMiles"]:
+        reasons.append(f"Miles {int(unit['Miles'])} > {int(row['MaxMiles'])} program cap.")
 
-        # Ensure advance <= MaxLTV by adding down if needed
-        bv = max(unit["BookValue"], 1.0)
-        adv_now = (unit["TotalCost"] - changes["down"] - F["trade_eq"]) / bv * 100.0
-        if adv_now > row["MaxLTV"]:
-            need_down = (unit["TotalCost"] - F["trade_eq"]) - (row["MaxLTV"]/100.0)*bv
-            extra = max(0.0, need_down - changes["down"])
-            if extra > 0:
-                changes["down"] += extra
-                reasons.append(f"Lower advance to ≤{int(row['MaxLTV'])}% (+${int(extra)} down).")
+    # Advance control after updating down (sell price recalcs at cap)
+    bv = max(float(unit["BookValue"]), 1.0)
+    def current_adv():
+        adv_now, sell_now = compute_advance_pct(row, unit, {**F, **changes})
+        return adv_now, sell_now
+    adv_now, sell_now = current_adv()
+    if adv_now > row["MaxLTV"]:
+        # pricing is already at cap; only lever is more down / less trade allowance
+        need_down = (sell_now - F["trade_eq"]) - (row["MaxLTV"]/100.0)*bv
+        extra = max(0.0, need_down - changes["down"])
+        if extra > 0:
+            changes["down"] += extra
+            reasons.append(f"Keep advance ≤{int(row['MaxLTV'])}% (+${int(extra)} down).")
 
+    # Income / repos / DL
     inc_total = F["income"] + (F["gig_income"] if F["gig"] else 0)
     if inc_total < row["MinIncome"]:
         short = int(row["MinIncome"] - inc_total)
@@ -349,54 +353,68 @@ def what_it_takes(row, features, unit):
     if (not row["AllowNoDL"]) and F["has_dl"] == "No":
         reasons.append("DL required.")
 
-    # Final gates with proposed term
+    # Re-check with changes
     temp2 = dict(F); temp2["desired_term"] = changes["term"]
     ok2, why2 = gates_ok(row, temp2, unit)
-    if ok2 and not reasons:
-        return {"fits": True, "changes": changes, "reason":"Meets program at lender edges"}
 
-    # Friction score (smaller is better)
+    # Friction: smaller is better; in aggressive mode, down bumps are cheaper
     fric = 0
-    fric += max(0, int((changes["down"] - F["down"]) / 100.0)) * (10 if F.get("aggressive") else 25)
+    fric += max(0, int((changes["down"] - F["down"]) / 100.0)) * (10 if F.get("aggressive", True) else 25)
     if changes["term"] < term_in: fric += 30
-    if unit is not None and unit["Miles"] > row["MaxMiles"]: fric += 300
+    if unit["Miles"] > row["MaxMiles"]): fric += 300
     if inc_total < row["MinIncome"]: fric += 200
     if F["repos"] > row["MaxRepos"]: fric += 200
     if (not row["AllowNoDL"]) and F["has_dl"] == "No": fric += 200
+
+    if ok2 and not reasons:
+        return {"fits": True, "changes": changes, "reason": "Meets program at lender edges"}
+
     if not ok2 and not reasons:
         reasons = [why2]
     return {"fits": False, "changes": changes, "reasons": reasons, "friction": fric}
 
+def gateway_priority_key(lender_name: str) -> int:
+    """Lower number = higher priority. Gateway wins ties."""
+    return 0 if str(lender_name).strip().lower() == "gateway financial solutions" else 1
+
 def desk_deal_assist(inventory_df, rules_df, features):
-    # Direct fits first
+    # Direct fits
     fits = []
     for _, u in inventory_df.iterrows():
         for _, r in rules_df.iterrows():
             ok, _ = gates_ok(r, features, u)
             if ok:
-                us, adv = unit_fit_score(r, u, features)
+                us, adv, sell, gross = unit_fit_score(r, u, features)
                 ls = lender_fit_score(r, features)
-                fits.append((us+ls, r, u, adv))
+                fits.append((us+ls, gateway_priority_key(r["Lender"]), r, u, adv, sell, gross))
     if fits:
-        fits.sort(key=lambda x: x[0], reverse=True)
-        score, r, u, adv = fits[0]
-        return {"status":"fits_now","lender":r["Lender"],"program":r["Program"],"unit":u,"advance":adv,"reason":"Meets program without changes.","alts":fits[1:4]}
+        fits.sort(key=lambda x: (x[0], -x[1]), reverse=True)  # highest score first; Gateway favored in ties
+        score, _, r, u, adv, sell, gross = fits[0]
+        return {"status":"fits_now","lender":r["Lender"],"program":r["Program"],"unit":u,
+                "advance":adv,"sell":sell,"gross":gross,"reason":"Meets program without changes.","alts":fits[1:4]}
 
-    # Otherwise smallest friction across all lender/unit pairs
+    # Smallest-change path
     best = None
     for _, u in inventory_df.iterrows():
         for _, r in rules_df.iterrows():
             wt = what_it_takes(r, features, u)
             if wt["fits"]:
-                us, adv = unit_fit_score(r, u, features)
+                us, adv, sell, gross = unit_fit_score(r, u, features)
                 ls = lender_fit_score(r, features)
                 total = us + ls
-                best = {"status":"fits_now","lender":r["Lender"],"program":r["Program"],"unit":u,"advance":adv,"reason":"Meets after reevaluation.","score":total}
-                return best
+                cand = {"status":"fits_now","lender":r["Lender"],"program":r["Program"],"unit":u,
+                        "advance":adv,"sell":sell,"gross":gross,"reason":"Meets after reevaluation.","score":total,
+                        "pri":gateway_priority_key(r["Lender"])}
+                if (best is None) or (total > best["score"]) or (total == best["score"] and cand["pri"] < best["pri"]):
+                    best = cand
             else:
                 fr = wt.get("friction", 1e9)
-                if (best is None) or (best.get("friction", 1e9) > fr):
-                    best = {"status":"needs_changes","lender":r["Lender"],"program":r["Program"],"unit":u,"changes":wt["changes"],"reasons":wt["reasons"],"friction":fr}
+                cand = {"status":"needs_changes","lender":r["Lender"],"program":r["Program"],"unit":u,
+                        "changes":wt["changes"],"reasons":wt["reasons"],"friction":fr,
+                        "pri":gateway_priority_key(r["Lender"])}
+                if (best is None) or (best.get("friction", 1e9) > fr) or \
+                   (best.get("friction", 1e9) == fr and cand["pri"] < best["pri"]):
+                    best = cand
     return best
 
 # =========================
@@ -409,23 +427,24 @@ if "rate_rules" not in st.session_state:
 # UI — header
 # =========================
 st.title("SmartDesk — Desking Assistant")
-st.caption("Upload a rate sheet (CSV/XLSX/PDF) and/or inventory, enter basics, and get a lender pick + the smallest change to get an approval. Aggressive mode maxes LTV/term per lender.")
+st.caption("Prices at lender MaxLTV cap. Gateway gets tie priority (POC). PDF/CSV/XLSX rate sheets, inventory upload, lender pick & smallest-change path.")
 
 with st.expander("File formats", expanded=False):
     st.markdown(
         """
-**Rate sheet (CSV/XLSX/PDF):**  
+**Rate sheet (CSV/XLSX/PDF)** — fields I look for (case-insensitive):  
 `Lender, Program, MinScore, MaxScore, MaxRepos, MinIncome, MinDown, MaxTerm, MaxMiles, MaxLTV, AllowGig, AllowNoDL, AllowFrame`  
-PDFs parsed heuristically (min score, term, miles, LTV, gig/No DL/frame keywords).
+PDFs parsed heuristically by keywords (*min score, max term, miles, LTV, frame, gig, no DL*).
 
-**Inventory (CSV/XLSX):**  
+**Inventory (CSV/XLSX)** — columns:  
 `Stock, Year, Make, Model, Trim, Miles, TotalCost (or Price), BookValue`  
-Filters always applied: **TotalCost ≥ $4,000**, exclude **Stock starting with W or T**.
+POC filter: keeps units **≥ $4,000** and **excludes Stock starting with W or T**.
         """
     )
 
 # =========================
-# Layout: Left inputs / Right uploads
+# LEFT: deal input
+# RIGHT: uploads
 # =========================
 left, right = st.columns([1.25, 1])
 
@@ -448,9 +467,14 @@ with left:
             job_months = st.number_input("Job Time (months)", 0, 11, 6, 1)
 
         st.markdown("—")
-        aggressive = st.checkbox("Aggressive (Max-Out) mode", value=True,
-                                 help="Prefer highest allowed advance and longest term per lender.")
-        show_backend_reminder = st.checkbox("Show Backend Products Reminder (no calc impact)", value=True)
+        aggressive = st.checkbox(
+            "Aggressive (Max-Out) mode",
+            value=True,
+            help="Prefer highest usable advance (LTV) and longest term within program caps."
+        )
+        # Price-at-cap is always on per your policy; keep a disabled box as a reminder
+        price_at_cap = True
+        st.checkbox("Price at lender cap (MaxLTV-based sell price)", value=True, disabled=True)
 
         include_co = st.checkbox("Include Co-Applicant?")
         if include_co:
@@ -466,12 +490,12 @@ with left:
 
 with right:
     st.subheader("Uploads")
-
-    rs_files = st.file_uploader("Rate sheets (CSV/XLSX/PDF) — multiple allowed",
-                                type=["csv","xlsx","pdf"], accept_multiple_files=True, key="rs_multi")
+    rs_files = st.file_uploader(
+        "Rate sheets (CSV/XLSX/PDF) — upload multiple if you want",
+        type=["csv","xlsx","pdf"], accept_multiple_files=True, key="rs_multi"
+    )
     inv_file = st.file_uploader("Inventory (CSV/XLSX)", type=["csv","xlsx"], key="inv")
 
-    # Merge uploaded rate sheets into active rules
     merged = st.session_state["rate_rules"].copy()
     if rs_files:
         pdf_cnt, tab_cnt = 0, 0
@@ -480,7 +504,7 @@ with right:
             try:
                 if name.endswith(".pdf"):
                     if not PDF_OK:
-                        st.warning("Install pdfplumber to parse PDFs (requirements.txt).")
+                        st.warning("Install pdfplumber in requirements.txt to parse PDFs.")
                         continue
                     dfpdf = parse_rate_pdf(f.read())
                     if not dfpdf.empty:
@@ -493,16 +517,16 @@ with right:
             except Exception as e:
                 st.error(f"Failed to read {f.name}: {e}")
         st.session_state["rate_rules"] = merged
-        st.success(f"Merged {tab_cnt} table rows + {pdf_cnt} PDF-derived rows into active rules.")
+        st.success(f"Merged: {tab_cnt} table rows + {pdf_cnt} pdf-derived rows")
 
     with st.expander("Current Rate Rules (top 20)", expanded=False):
         st.dataframe(st.session_state["rate_rules"].head(20), use_container_width=True)
 
 # =========================
-# Lender Q&A (keyword search)
+# Lender Q&A (quick search)
 # =========================
 st.subheader("Ask about a lender rule")
-q = st.text_input("Example: Does Exeter allow frame damage? or Gateway gig income?")
+q = st.text_input("Example: Does Gateway allow gig income? or Exeter frame damage?")
 if q.strip():
     rules = st.session_state["rate_rules"].copy()
     hay = rules.apply(lambda r: " ".join(str(v) for v in r.values), axis=1).str.lower()
@@ -513,9 +537,16 @@ if q.strip():
         st.dataframe(hits, use_container_width=True)
 
 # =========================
-# Evaluate Deal (assume desired term = 60 mo)
+# Evaluate Deal
 # =========================
 if submitted:
+    # Reminder banner: no backend products included
+    st.markdown(
+        "<div class='banner'><b>Reminder:</b> Pricing is set at each lender's MaxLTV cap. No backend products "
+        "(GAP/warranty/etc.) included in advance. If you add products later, re-check with the lender.</div>",
+        unsafe_allow_html=True
+    )
+
     features = {
         "credit": credit,
         "income": monthly_income,
@@ -527,14 +558,13 @@ if submitted:
         "job_months": job_months,
         "down": float(down),
         "trade_eq": float(trade_eq),
-        "desired_term": 60,  # fixed; no user input
+        "desired_term": 60,         # fixed (input removed earlier)
         "co_score": co_score,
         "co_income": co_income,
         "aggressive": aggressive,
-        "backend_reminder": show_backend_reminder,
+        "price_at_cap": True,       # always True per your policy
     }
 
-    # rules
     rules = st.session_state["rate_rules"].copy()
     for c in ["MinScore","MaxScore","MaxRepos","MinIncome","MinDown","MaxTerm","MaxMiles","MaxLTV"]:
         if c in rules.columns:
@@ -545,12 +575,12 @@ if submitted:
     if "Program" not in rules.columns:
         rules["Program"] = "POC"
 
-    # inventory
+    # Inventory: uploaded or default POC
     if inv_file is not None:
         try:
             ext = ".csv" if inv_file.name.lower().endswith(".csv") else ".xlsx"
-            data = inv_file.read()
-            inv_df = pd.read_csv(BytesIO(data)) if ext==".csv" else pd.read_excel(BytesIO(data))
+            inv_bytes = inv_file.read()
+            inv_df = pd.read_csv(BytesIO(inv_bytes)) if ext==".csv" else pd.read_excel(BytesIO(inv_bytes))
             INV = normalize_inventory(inv_df)
             st.success(f"Loaded {len(INV)} inventory units from **{inv_file.name}** (after filters).")
         except Exception as e:
@@ -559,7 +589,7 @@ if submitted:
     else:
         INV = normalize_inventory(HARD_INVENTORY)
 
-    # ===== Deal Desk Assist =====
+    # ---------- Deal Desk Assist ----------
     st.markdown("## Deal Desk Assist")
     plan = desk_deal_assist(INV, rules, features)
     if plan is None:
@@ -572,11 +602,14 @@ if submitted:
             st.markdown(f"**{plan['lender']}** — {plan['program']}")
             st.markdown(
                 f"- **Unit:** {int(u['Year'])} {u['Make']} {u['Model']} {u.get('Trim','') or ''}  \n"
-                f"- **Miles:** {int(u['Miles'])}  •  **Price:** ${int(u['TotalCost'])}  •  **Book:** ${int(u['BookValue'])}  \n"
-                f"- **Advance:** {plan['advance']:.1f}%"
+                f"- **Miles:** {int(u['Miles'])}  •  **Cost:** ${int(u['TotalCost'])}  •  **Book:** ${int(u['BookValue'])}"
             )
-            if features.get("aggressive"):
-                st.caption("Aggressive mode: targeting lender max term and highest allowed advance within caps.")
+            st.markdown(
+                f"- **Suggested Sell Price (at cap):** ${int(round(plan['sell']))}  •  "
+                f"**Advance:** {plan['advance']:.1f}%  •  **Front Gross (est):** ${int(round(plan['gross']))}"
+            )
+            if features.get("aggressive", True):
+                st.caption("Aggressive mode: targeting lender max term; down auto-bumped only if needed to keep advance ≤ MaxLTV.")
             st.markdown("</div>", unsafe_allow_html=True)
         else:
             u = plan["unit"]
@@ -585,7 +618,7 @@ if submitted:
             st.markdown(f"**{plan['lender']}** — {plan['program']}")
             st.markdown(
                 f"- **Unit:** {int(u['Year'])} {u['Make']} {u['Model']} {u.get('Trim','') or ''}  \n"
-                f"- **Miles:** {int(u['Miles'])}  •  **Price:** ${int(u['TotalCost'])}  •  **Book:** ${int(u['BookValue'])}"
+                f"- **Miles:** {int(u['Miles'])}  •  **Cost:** ${int(u['TotalCost'])}  •  **Book:** ${int(u['BookValue'])}"
             )
             ch = plan.get("changes", {})
             bullets = []
@@ -599,19 +632,12 @@ if submitted:
                 st.markdown("**Why:**  \n- " + "\n- ".join(plan["reasons"]))
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Optional: Backend reminder (no calc effect)
-        if features.get("backend_reminder"):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="metric">🔔 Backend Products Reminder</div>', unsafe_allow_html=True)
-            st.markdown(
-                "- If lender permits: consider **GAP** and/or **service contract** on delivery.\n"
-                "- Confirm **max advance** headroom before penciling products.\n"
-                "- Verify **stip stack** first (POI, POR, 5 refs, insurance) to keep call clean."
-            )
-            st.caption("Reminder only — products are NOT included in any advance calculations here.")
-            st.markdown('</div>', unsafe_allow_html=True)
+        # Talking points
+        st.markdown("### Call-in summary")
+        st.markdown("**Buyer**  \n- Price is set at lender cap; explain down/term and expected stips.  \n- Unit fits book/miles/advance.")
+        st.markdown("**Lender**  \n- Stability story (job time, income).  \n- Advance at/below cap with requested term.  \n- Backup: small down bump or shorter term if needed.")
 
-    # ===== Top lender matches (as-is) =====
+    # ---------- Top Lenders ----------
     st.markdown("### Top Lender Matches")
     rows = []
     for _, r in rules.iterrows():
@@ -620,15 +646,18 @@ if submitted:
             "Lender": r["Lender"],
             "Program": r["Program"],
             "Reason": "Meets program" if ok else why,
-            "Score": round(lender_fit_score(r, features),1) if ok else 0.0
+            "Score": round(lender_fit_score(r, features),1) if ok else 0.0,
+            "Priority": "Gateway" if gateway_priority_key(r["Lender"])==0 else "",
         })
-    lenders_df = pd.DataFrame(rows).sort_values("Score", ascending=False).head(10)
+    lenders_df = pd.DataFrame(rows).sort_values(
+        by=["Score","Priority"], ascending=[False, True]
+    ).head(10)
     if not lenders_df.empty:
         st.dataframe(lenders_df, use_container_width=True)
     else:
         st.info("No lender fits with the current customer inputs.")
 
-    # ===== Top 5 units (best lender–unit pairs) =====
+    # ---------- Top 5 Units ----------
     st.markdown("### Top 5 Units (best lender–unit pairs)")
     best_rows = []
     for _, u in INV.iterrows():
@@ -636,25 +665,30 @@ if submitted:
         for _, r in rules.iterrows():
             ok, _ = gates_ok(r, features, u)
             if ok:
-                us, adv = unit_fit_score(r, u, features)
+                us, adv, sell, gross = unit_fit_score(r, u, features)
                 ls = lender_fit_score(r, features)
-                best_for_unit.append((us+ls, r, adv))
+                best_for_unit.append((us+ls, gateway_priority_key(r["Lender"]), r, adv, sell, gross))
         if best_for_unit:
-            best_for_unit.sort(key=lambda x: x[0], reverse=True)
-            score, r, adv = best_for_unit[0]
+            best_for_unit.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+            score, _, r, adv, sell, gross = best_for_unit[0]
             best_rows.append({
                 "Stock": u["Stock"],
                 "Unit": f"{int(u['Year'])} {u['Make']} {u['Model']} {u.get('Trim','') or ''}",
                 "Miles": int(u["Miles"]),
-                "Price": int(u["TotalCost"]),
+                "Cost": int(u["TotalCost"]),
                 "Book": int(u["BookValue"]),
+                "Sell@Cap": int(round(sell)),
                 "Advance%": round(adv,1),
+                "FrontGross": int(round(gross)),
                 "Lender": r["Lender"],
                 "Program": r["Program"],
-                "FitScore": round(score,1)
+                "FitScore": round(score,1),
+                "Priority": "Gateway" if gateway_priority_key(r["Lender"])==0 else "",
             })
     if best_rows:
-        top_units = pd.DataFrame(best_rows).sort_values("FitScore", ascending=False).head(5)
+        top_units = pd.DataFrame(best_rows).sort_values(
+            by=["FitScore","Priority"], ascending=[False, True]
+        ).head(5)
         st.dataframe(top_units, use_container_width=True)
     else:
         st.info("No units fit with any lender using these rules & filters.")
