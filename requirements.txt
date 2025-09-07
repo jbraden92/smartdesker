@@ -4,3 +4,5 @@ openpyxl
 altair
 pdfplumber
 scikit-learn
+pillow
+pytesseract
